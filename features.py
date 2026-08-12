@@ -100,6 +100,15 @@ def add_features(data: pd.DataFrame, target: str = TARGET) -> pd.DataFrame:
     return d
 
 
+# Raw passthrough columns that sometimes leak into feature_cols from older
+# training runs (because the training script selected "every column that
+# isn't the target" rather than an explicit feature list). These carry no
+# real predictive signal and, worse, are exactly the columns a live/appended
+# row is most likely to arrive without — so a stale/incomplete value here
+# must never block using the row for forecasting.
+NON_PREDICTIVE_PASSTHROUGH_COLS = {"year", "day"}
+
+
 def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: str = TARGET):
     """
     Given the FULL raw dataframe (date-indexed, including target + weather
@@ -112,7 +121,15 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     current data / wasn't in this dataset when the model was trained).
     """
     df_feat = add_features(df_raw, target=target)
-    df_feat_clean = df_feat.dropna()
+
+    # Only require the columns the model actually consumes to be non-null —
+    # and even among those, skip known non-predictive passthrough columns
+    # (year/day) that shouldn't gate whether a fresh row can be forecast.
+    cols_to_check = [
+        c for c in feature_cols
+        if c in df_feat.columns and c not in NON_PREDICTIVE_PASSTHROUGH_COLS
+    ]
+    df_feat_clean = df_feat.dropna(subset=cols_to_check) if cols_to_check else df_feat.dropna()
 
     if df_feat_clean.empty:
         raise ValueError(
@@ -120,7 +137,17 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
             "(need at least ~14+ prior days of continuous data)."
         )
 
-    last_row = df_feat_clean.iloc[[-1]]
+    last_row = df_feat_clean.iloc[[-1]].copy()
+
+    # Backfill non-predictive passthrough columns from the row's own date if
+    # they came through as NaN (e.g. a live-appended row that never had a
+    # raw year/day value). The model still expects *some* numeric value in
+    # that column slot since it was part of training's column list.
+    last_date_val = last_row.index[-1]
+    if "year" in last_row.columns and last_row["year"].isna().any():
+        last_row["year"] = last_date_val.year
+    if "day" in last_row.columns and last_row["day"].isna().any():
+        last_row["day"] = last_date_val.day
     last_date = df_feat_clean.index[-1]
 
     missing = [c for c in feature_cols if c not in last_row.columns]
