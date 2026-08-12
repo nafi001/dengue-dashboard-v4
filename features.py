@@ -7,14 +7,15 @@ if you change one, change the other, or the saved models will receive
 inputs they weren't trained on.
 
 Column names match the actual data source:
-    Date, YEAR, MONTH, DAY, SHA, RHA, RA, PSA, WSA, WD, TA, DA,
+    Date, YEAR, MONTH, DAY, RHA, RA, PSA, WSA, WD, TA, DA,
     Max_TA, Min_TA, Confirm_Dengue
-(lowercased on load, so: date, year, month, day, sha, rha, ra, psa, wsa,
+(lowercased on load, so: date, year, month, day, rha, ra, psa, wsa,
  wd, ta, da, max_ta, min_ta, confirm_dengue)
 """
 
 import warnings
 
+import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -25,16 +26,15 @@ TARGET_LAGS = [1, 2, 3, 7, 14]
 TARGET_ROLL_WINDOWS = [3, 7, 14]
 
 # Full weather variable set as it actually appears in the data.
-# sha = sunshine hours, rha = relative humidity, ra = rainfall, psa = pressure,
+# rha = relative humidity, ra = rainfall, psa = pressure,
 # wsa = wind speed, wd = wind direction, ta = avg temp, da = dew point,
 # max_ta / min_ta = max/min temp.
-WEATHER_COLS_CANDIDATES = ["sha", "rha", "ra", "psa", "wsa", "wd", "ta", "da", "max_ta", "min_ta"]
+WEATHER_COLS_CANDIDATES = ["rha", "ra", "psa", "wsa", "wd", "ta", "da", "max_ta", "min_ta"]
 WEATHER_LAGS = [1, 2, 3, 7]
 WEATHER_ROLL_WINDOWS = [3, 7, 14]
 
 # Human-readable labels for the UI (with units)
 WEATHER_LABELS = {
-    "sha": "Sunshine hours (hr)",
     "rha": "Relative humidity (%)",
     "ra": "Rainfall (mm)",
     "psa": "Surface pressure (kPa)",
@@ -156,25 +156,59 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     return row, last_date, missing
 
 
-def monthly_climatology(df_raw: pd.DataFrame, weather_cols: list) -> pd.DataFrame:
-    """Historical average of each weather variable, grouped by calendar month
-    (1-12), computed from all available history. Used to auto-fill a new
-    day's weather entry when the user doesn't have today's reading yet."""
+def daily_climatology(df_raw: pd.DataFrame, weather_cols: list) -> pd.DataFrame:
+    """Historical average of each weather variable, grouped by exact
+    day-of-year (1-366), computed across all available years of history.
+    Far more granular than a monthly average — e.g. Aug 3rd gets its own
+    average instead of sharing one flat number with every other day in
+    August. Used to auto-fill a new day's weather entry."""
     cols_present = [c for c in weather_cols if c in df_raw.columns]
     if not cols_present:
         return pd.DataFrame()
-    return df_raw.groupby(df_raw.index.month)[cols_present].mean()
+    return df_raw.groupby(df_raw.index.dayofyear)[cols_present].mean()
 
 
 def autofill_weather_for_date(df_raw: pd.DataFrame, target_date, weather_cols: list) -> dict:
-    """Return {col: historical_monthly_avg} for the month of target_date,
-    using all data currently in df_raw. Empty dict if no history exists yet
-    for that month or no weather columns are present."""
-    clim = monthly_climatology(df_raw, weather_cols)
+    """Return {col: value} to pre-fill weather inputs for target_date.
+
+    For each weather column independently:
+      1. Use the historical average for that exact day-of-year, if any
+         prior-year data exists for that day.
+      2. Otherwise, fall back to the nearest day-of-year (by calendar
+         distance, wrapping around the Dec 31 -> Jan 1 boundary) that does
+         have historical data for that column.
+      3. If a column has no historical data at all, it's omitted from the
+         result (left for the user to fill in manually).
+
+    Values are rounded to 4 decimal places.
+    """
+    clim = daily_climatology(df_raw, weather_cols)
     if clim.empty:
         return {}
-    month = pd.Timestamp(target_date).month
-    if month not in clim.index:
-        return {}
-    row = clim.loc[month]
-    return {c: float(row[c]) for c in row.index if pd.notna(row[c])}
+
+    target_doy = pd.Timestamp(target_date).dayofyear
+    # Account for leap years: day-of-year can run 1-366, so wrap using 366
+    # as the period regardless of whether target_date's own year is a leap
+    # year — this keeps Dec 31 <-> Jan 1 adjacency correct either way.
+    period = 366
+
+    result = {}
+    for col in clim.columns:
+        col_series = clim[col].dropna()
+        if col_series.empty:
+            continue  # no historical data at all for this variable
+
+        if target_doy in col_series.index:
+            value = col_series.loc[target_doy]
+        else:
+            # nearest available day-of-year, wrapping around the year boundary
+            available_days = col_series.index.to_numpy()
+            forward_dist = (available_days - target_doy) % period
+            backward_dist = (target_doy - available_days) % period
+            circular_dist = np.minimum(forward_dist, backward_dist)
+            nearest_idx = np.argmin(circular_dist)
+            value = col_series.iloc[nearest_idx]
+
+        result[col] = round(float(value), 4)
+
+    return result
