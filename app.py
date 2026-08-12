@@ -54,7 +54,10 @@ DATA_DIR.mkdir(exist_ok=True)
 LIVE_DATA_PATH = DATA_DIR / "current_data.csv"
 
 HORIZONS = [7, 14]
-CONF_Z = 1.645  # ~90% interval using residual std (normal approx)
+
+# z-scores for selectable confidence intervals (normal approximation on residual std)
+CONF_Z_LOOKUP = {80: 1.282, 90: 1.645, 95: 1.960, 99: 2.576}
+DEFAULT_CONF_LEVEL = 90
 
 st.set_page_config(
     page_title="Dengue Forecasting Dashboard",
@@ -101,19 +104,6 @@ def load_metadata():
 
 
 @st.cache_data(show_spinner=False)
-def load_model_params(horizon: int):
-    """Reads hyperparameters saved by either training script:
-    GA-tuned runs save ga_best_params_h{H}.json, fixed-hyperparameter
-    runs save model_params_h{H}.json. Whichever exists is used."""
-    for fname in (f"ga_best_params_h{horizon}.json", f"model_params_h{horizon}.json"):
-        path = ARTIFACT_DIR / fname
-        if path.exists():
-            with open(path) as f:
-                return json.load(f), fname
-    return None, None
-
-
-@st.cache_data(show_spinner=False)
 def load_step_metrics(horizon: int):
     """Reads step-level test metrics (step, mae, rmse, r2) saved by the
     training script as step_metrics_h{H}.csv, if present."""
@@ -124,7 +114,10 @@ def load_step_metrics(horizon: int):
 
 
 def artifacts_available() -> bool:
-    return all((ARTIFACT_DIR / f"production_model_h{h}.pkl").exists() for h in HORIZONS)
+    """The 7-day model is the minimum requirement for any forecast at all.
+    The 14-day model is optional — generate_blended_forecast() falls back
+    to a 7-day-only forecast with a warning if it's missing."""
+    return (ARTIFACT_DIR / "production_model_h7.pkl").exists()
 
 
 # --------------------------------------------------------------------------
@@ -173,7 +166,7 @@ def append_new_row(df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # FORECASTING
 # --------------------------------------------------------------------------
-def generate_forecast(df_raw: pd.DataFrame, horizon: int):
+def generate_forecast(df_raw: pd.DataFrame, horizon: int, conf_z: float = CONF_Z_LOOKUP[DEFAULT_CONF_LEVEL]):
     model = load_model(horizon)
     feature_cols = load_feature_cols(horizon)
     residual_std = load_residual_std(horizon)
@@ -200,8 +193,8 @@ def generate_forecast(df_raw: pd.DataFrame, horizon: int):
 
     lower, upper = None, None
     if residual_std is not None and len(residual_std) == horizon:
-        lower = np.clip(y_pred - CONF_Z * residual_std, 0, None)
-        upper = y_pred + CONF_Z * residual_std
+        lower = np.clip(y_pred - conf_z * residual_std, 0, None)
+        upper = y_pred + conf_z * residual_std
 
     return {
         "dates": future_dates,
@@ -210,6 +203,70 @@ def generate_forecast(df_raw: pd.DataFrame, horizon: int):
         "upper": upper,
         "as_of": last_date,
         "missing_weather_cols": missing,
+    }
+
+
+def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKUP[DEFAULT_CONF_LEVEL]):
+    """
+    Produces one consistent 14-day forecast instead of two disagreeing ones.
+
+    Decision makers get confused when the 7-day model says day 3 is 560 but
+    the 14-day model says 682 for that same day — both are separately-trained
+    SVRs and will never agree exactly. Since the 7-day model is trained
+    specifically for near-term accuracy, we always use ITS predictions for
+    days 1-7, and only fall back to the 14-day model for days 8-14 (which
+    the 7-day model can't produce at all). The result is a single number
+    per date, everywhere.
+    """
+    res7 = generate_forecast(df_raw, 7, conf_z=conf_z)
+    res14 = generate_forecast(df_raw, 14, conf_z=conf_z) if 14 in HORIZONS else None
+
+    if res7 is None:
+        return None
+
+    dates = list(res7["dates"])
+    pred = list(res7["pred"])
+    lower = list(res7["lower"]) if res7["lower"] is not None else None
+    upper = list(res7["upper"]) if res7["upper"] is not None else None
+    source = ["7-day model"] * len(dates)
+
+    warnings = []
+    if res7["missing_weather_cols"]:
+        warnings.append(f"7-day model: missing {res7['missing_weather_cols'][:6]}")
+
+    if res14 is not None:
+        # Append only steps 8-14 from the 14-day model — steps 1-7 are
+        # discarded even though the model produced them, specifically to
+        # avoid ever showing two different numbers for the same date.
+        extra_dates = res14["dates"][7:]
+        extra_pred = list(res14["pred"][7:])
+        dates += extra_dates
+        pred += extra_pred
+        source += ["14-day model"] * len(extra_dates)
+        if lower is not None and res14["lower"] is not None:
+            lower += list(res14["lower"][7:])
+        elif lower is not None:
+            lower += [np.nan] * len(extra_dates)
+        if upper is not None and res14["upper"] is not None:
+            upper += list(res14["upper"][7:])
+        elif upper is not None:
+            upper += [np.nan] * len(extra_dates)
+        if res14["missing_weather_cols"]:
+            warnings.append(f"14-day model: missing {res14['missing_weather_cols'][:6]}")
+        as_of_14 = res14["as_of"]
+    else:
+        as_of_14 = None
+        warnings.append("14-day model artifacts not found — showing 7-day forecast only.")
+
+    return {
+        "dates": dates,
+        "pred": np.array(pred),
+        "lower": np.array(lower) if lower is not None else None,
+        "upper": np.array(upper) if upper is not None else None,
+        "source": source,
+        "as_of_7": res7["as_of"],
+        "as_of_14": as_of_14,
+        "warnings": warnings,
     }
 
 
@@ -345,11 +402,11 @@ if live_df.empty:
     st.info("👈 Add today's data or upload a CSV in the sidebar to get started.")
     st.stop()
 
-tab_overview, tab_forecast, tab_corr, tab_reliability, tab_model = st.tabs(
-    ["📊 Overview", "🔮 Forecast", "🔗 Weather correlation", "📈 Model reliability", "⚙️ Model info"]
+tab_overview, tab_corr, tab_reliability = st.tabs(
+    ["📊 Overview & Forecast", "🔗 Weather correlation", "📈 Model reliability"]
 )
 
-# ---- OVERVIEW TAB ---------------------------------------------------------
+# ---- OVERVIEW & FORECAST TAB ----------------------------------------------
 with tab_overview:
     latest_val = live_df[TARGET].iloc[-1]
     latest_date = live_df.index[-1]
@@ -403,6 +460,113 @@ with tab_overview:
              "Needs at least one prior year of data for this month to compute.",
     )
 
+    st.divider()
+
+    # ---------------- FORECAST ----------------
+    st.subheader("🔮 14-day forecast")
+    st.caption(
+        "Days 1–7 come from the model trained specifically for near-term accuracy; "
+        "days 8–14 extend the outlook using the longer-horizon model. Each date "
+        "shows exactly one number, so there's no disagreement between models to "
+        "reconcile."
+    )
+
+    if not artifacts_available():
+        st.warning("No trained model artifacts found. Run the training script first and commit "
+                    "`dashboard_artifacts/` to the repo.")
+    else:
+        fcol1, fcol2 = st.columns([1, 3])
+        with fcol1:
+            conf_level = st.selectbox(
+                "Confidence interval", options=[80, 90, 95, 99],
+                index=[80, 90, 95, 99].index(DEFAULT_CONF_LEVEL),
+                format_func=lambda x: f"{x}%",
+                help="Wider intervals (99%) are more likely to contain the true value "
+                     "but give a less precise range. Based on historical test-set error, "
+                     "not live-recalculated.",
+            )
+        conf_z = CONF_Z_LOOKUP[conf_level]
+
+        latest_row_date = live_df.index.max().date()
+        st.caption(f"Latest date in current dataset: **{latest_row_date}**")
+
+        if st.button("🔄 Regenerate forecast now", type="primary"):
+            st.session_state["run_forecast"] = True
+
+        if st.session_state.get("run_forecast"):
+            try:
+                blended = generate_blended_forecast(live_df, conf_z=conf_z)
+            except Exception as e:
+                blended = None
+                st.error(f"Could not generate forecast: {e}")
+
+            if blended is not None:
+                for w in blended["warnings"]:
+                    st.warning(w)
+
+                stale_dates = []
+                if blended["as_of_7"].date() < latest_row_date:
+                    stale_dates.append(f"7-day model (as of {blended['as_of_7'].date()})")
+                if blended["as_of_14"] is not None and blended["as_of_14"].date() < latest_row_date:
+                    stale_dates.append(f"14-day model (as of {blended['as_of_14'].date()})")
+                if stale_dates:
+                    st.warning(
+                        f"⚠️ {' and '.join(stale_dates)} used data older than your dataset's latest "
+                        f"row ({latest_row_date}). This usually means a gap or missing field in a "
+                        "recent entry — check the sidebar's data health check."
+                    )
+
+                ffig = go.Figure()
+                hist_tail = live_df[TARGET].tail(30)
+                ffig.add_trace(go.Scatter(x=hist_tail.index, y=hist_tail.values, mode="lines", name="Recent actual"))
+
+                # split forecast trace by source so days 1-7 vs 8-14 are visually distinguishable
+                n7 = sum(1 for s in blended["source"] if s == "7-day model")
+                ffig.add_trace(go.Scatter(
+                    x=blended["dates"][:n7], y=blended["pred"][:n7], mode="lines+markers",
+                    name="Forecast (days 1\u20137)", line=dict(color="firebrick"),
+                ))
+                if len(blended["dates"]) > n7:
+                    # connect the two segments visually with an overlapping point
+                    ffig.add_trace(go.Scatter(
+                        x=blended["dates"][n7 - 1:], y=blended["pred"][n7 - 1:], mode="lines+markers",
+                        name="Forecast (days 8\u201314)", line=dict(color="firebrick", dash="dot"),
+                    ))
+                if blended["lower"] is not None:
+                    valid = ~np.isnan(blended["lower"]) & ~np.isnan(blended["upper"])
+                    d_valid = [d for d, v in zip(blended["dates"], valid) if v]
+                    lo_valid = blended["lower"][valid]
+                    up_valid = blended["upper"][valid]
+                    ffig.add_trace(go.Scatter(
+                        x=d_valid + d_valid[::-1],
+                        y=list(up_valid) + list(lo_valid[::-1]),
+                        fill="toself", fillcolor="rgba(178,34,34,0.15)",
+                        line=dict(color="rgba(255,255,255,0)"), name=f"~{conf_level}% interval", showlegend=True,
+                    ))
+                ffig.update_layout(height=400, margin=dict(t=20, b=20), hovermode="x unified")
+                st.plotly_chart(ffig, use_container_width=True)
+
+                fc_table = pd.DataFrame({
+                    "Date": [d.date() for d in blended["dates"]],
+                    "Forecast": np.round(blended["pred"], 1),
+                    "Source": blended["source"],
+                })
+                if blended["lower"] is not None:
+                    fc_table[f"Lower (~{conf_level}%)"] = np.round(blended["lower"], 1)
+                    fc_table[f"Upper (~{conf_level}%)"] = np.round(blended["upper"], 1)
+                st.dataframe(fc_table, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download forecast CSV",
+                    fc_table.to_csv(index=False).encode(),
+                    f"forecast_14day_{latest_row_date}.csv",
+                    "text/csv",
+                )
+        else:
+            st.info("Click **Regenerate forecast** to run the models on the current dataset.")
+
+    st.divider()
+
+    # ---------------- CASE TREND ----------------
     st.subheader("Case trend")
     window_options = sorted(set([30, 60, 90, 180, 365, len(live_df)]))
     window = st.select_slider("Show last N days", options=window_options, value=min(90, len(live_df)))
@@ -418,6 +582,41 @@ with tab_overview:
     fig.update_layout(height=380, margin=dict(t=20, b=20), hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
+    # ---------------- YEAR-OVER-YEAR COMPARISON ----------------
+    years_present = sorted(live_df.index.year.unique())
+    if len(years_present) >= 2:
+        st.subheader("Year-over-year comparison")
+        st.caption(
+            "Each year plotted by day-of-year, so seasons line up regardless of "
+            "which calendar year they fell in — makes it easy to see if this "
+            "year is running above, below, or in line with previous years."
+        )
+        yoy_default = years_present[-3:] if len(years_present) > 3 else years_present
+        yoy_years = st.multiselect("Years to compare", years_present, default=yoy_default)
+        if yoy_years:
+            yfig = go.Figure()
+            for yr in sorted(yoy_years):
+                yr_data = live_df[live_df.index.year == yr]
+                yfig.add_trace(go.Scatter(
+                    x=yr_data.index.dayofyear, y=yr_data[TARGET],
+                    mode="lines", name=str(yr),
+                    line=dict(width=2.5 if yr == latest_date.year else 1.5),
+                ))
+            yfig.update_layout(
+                height=400, margin=dict(t=20, b=20), hovermode="x unified",
+                xaxis_title="Day of year", yaxis_title="Confirmed dengue cases",
+            )
+            st.plotly_chart(yfig, use_container_width=True)
+
+        # monthly comparison table — this year vs each prior year
+        st.markdown("**Monthly totals by year**")
+        monthly = live_df.groupby([live_df.index.year, live_df.index.month])[TARGET].sum().unstack(level=0)
+        monthly.index.name = "Month"
+        monthly.columns.name = None
+        monthly = monthly.rename(index={i: pd.Timestamp(2000, i, 1).strftime("%B") for i in range(1, 13)})
+        st.dataframe(monthly.style.format("{:.0f}", na_rep="—"), use_container_width=True)
+
+    # ---------------- WEATHER CONDITIONS ----------------
     weather_present = [c for c in WEATHER_COLS_CANDIDATES if c in live_df.columns]
     if weather_present:
         st.subheader("Weather conditions")
@@ -444,86 +643,16 @@ with tab_overview:
             wfig.update_layout(height=220 * n, margin=dict(t=40, b=20), hovermode="x unified")
             st.plotly_chart(wfig, use_container_width=True)
 
-# ---- FORECAST TAB ----------------------------------------------------------
-with tab_forecast:
-    if not artifacts_available():
-        st.warning("No trained model artifacts found. Run the training script first and commit "
-                    "`dashboard_artifacts/` to the repo.")
-    else:
-        st.subheader("Generate forecast from the latest data")
-        st.caption(
-            "Forecasts are regenerated from the most recent rows in your current dataset — "
-            "lag and rolling-window features (the biggest contributors) update automatically "
-            "every time you add a new day."
-        )
-        latest_row_date = live_df.index.max().date()
-        st.caption(f"Latest date in current dataset: **{latest_row_date}**")
-
-        if st.button("🔄 Regenerate forecast now", type="primary"):
-            st.session_state["run_forecast"] = True
-
-        if st.session_state.get("run_forecast"):
-            results = {}
-            errors = {}
-            for h in HORIZONS:
-                try:
-                    results[h] = generate_forecast(live_df, h)
-                except Exception as e:
-                    errors[h] = str(e)
-
-            for h in HORIZONS:
-                st.markdown(f"#### {h}-day horizon")
-                if h in errors:
-                    st.error(errors[h])
-                    continue
-
-                res = results[h]
-                if res["missing_weather_cols"]:
-                    st.warning(
-                        "Some weather features the model expects weren't found in the current "
-                        f"data columns: {res['missing_weather_cols'][:6]}. Predictions may be degraded."
-                    )
-                if res["as_of"].date() < latest_row_date:
-                    st.warning(
-                        f"⚠️ This forecast is based on data through **{res['as_of'].date()}**, but your "
-                        f"dataset's latest row is **{latest_row_date}**. The gap usually means one or more "
-                        "recent days have missing weather/case values, so the newest rows were dropped "
-                        "when computing lag/rolling features. Check the Data tab for gaps, or fill any "
-                        "missing fields for the newest dates and click Regenerate again."
-                    )
-                st.caption(f"Forecast generated from data as of **{res['as_of'].date()}**")
-
-                ffig = go.Figure()
-                hist_tail = live_df[TARGET].tail(30)
-                ffig.add_trace(go.Scatter(x=hist_tail.index, y=hist_tail.values, mode="lines", name="Recent actual"))
-                ffig.add_trace(go.Scatter(x=res["dates"], y=res["pred"], mode="lines+markers", name="Forecast", line=dict(color="firebrick")))
-                if res["lower"] is not None:
-                    ffig.add_trace(go.Scatter(
-                        x=res["dates"] + res["dates"][::-1],
-                        y=list(res["upper"]) + list(res["lower"][::-1]),
-                        fill="toself", fillcolor="rgba(178,34,34,0.15)",
-                        line=dict(color="rgba(255,255,255,0)"), name="~90% interval", showlegend=True,
-                    ))
-                ffig.update_layout(height=380, margin=dict(t=20, b=20), hovermode="x unified")
-                st.plotly_chart(ffig, use_container_width=True)
-
-                fc_table = pd.DataFrame({
-                    "Date": [d.date() for d in res["dates"]],
-                    "Forecast": np.round(res["pred"], 1),
-                })
-                if res["lower"] is not None:
-                    fc_table["Lower (~90%)"] = np.round(res["lower"], 1)
-                    fc_table["Upper (~90%)"] = np.round(res["upper"], 1)
-                st.dataframe(fc_table, use_container_width=True, hide_index=True)
-                st.download_button(
-                    f"Download {h}-day forecast CSV",
-                    fc_table.to_csv(index=False).encode(),
-                    f"forecast_h{h}_{res['as_of'].date()}.csv",
-                    "text/csv",
-                    key=f"dl_{h}",
-                )
-        else:
-            st.info("Click **Regenerate forecast** to run the models on the current dataset.")
+    # ---------------- RECENT DATA TABLE ----------------
+    st.subheader("Recent daily data")
+    st.caption("Last 14 days — cases and weather side by side, for a quick manual scan.")
+    display_cols = [TARGET] + weather_present
+    recent_table = live_df[display_cols].tail(14).reset_index()
+    recent_table.columns = ["Date"] + [
+        "Confirmed cases" if c == TARGET else WEATHER_LABELS.get(c, c) for c in display_cols
+    ]
+    recent_table["Date"] = recent_table["Date"].dt.date
+    st.dataframe(recent_table, use_container_width=True, hide_index=True)
 
 # ---- WEATHER CORRELATION TAB ---------------------------------------------
 with tab_corr:
@@ -685,30 +814,3 @@ with tab_reliability:
                     hovermode="x unified",
                 )
                 st.plotly_chart(fig, use_container_width=True)
-
-        st.divider()
-        st.subheader("Summary")
-        summary_rows = []
-        for h, df in available.items():
-            summary_rows.append({
-                "Horizon": f"H={h}",
-                "Mean MAE": round(df["mae"].mean(), 2),
-                "Mean RMSE": round(df["rmse"].mean(), 2),
-                "Mean R\u00b2": round(df["r2"].mean(), 3),
-                "Best step (by R\u00b2)": int(df.loc[df["r2"].idxmax(), "step"]),
-                "Worst step (by R\u00b2)": int(df.loc[df["r2"].idxmin(), "step"]),
-            })
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-# ---- MODEL INFO TAB ----------------------------------------------------
-with tab_model:
-    st.subheader("Model details")
-    meta = load_metadata()
-    if meta:
-        st.json(meta)
-    for h in HORIZONS:
-        params, source_file = load_model_params(h)
-        if params:
-            label = "GA-tuned" if source_file and source_file.startswith("ga_best") else "Fixed"
-            st.markdown(f"**{label} SVR params, H={h}:**")
-            st.json(params)
