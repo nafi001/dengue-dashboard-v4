@@ -5,18 +5,46 @@ Feature engineering shared between the training script and the Streamlit
 dashboard. This MUST stay in lockstep with train_ga_svr_dashboard.py —
 if you change one, change the other, or the saved models will receive
 inputs they weren't trained on.
+
+Column names match the actual data source:
+    Date, YEAR, MONTH, DAY, SHA, RHA, RA, PSA, WSA, WD, TA, DA,
+    Max_TA, Min_TA, Confirm_Dengue
+(lowercased on load, so: date, year, month, day, sha, rha, ra, psa, wsa,
+ wd, ta, da, max_ta, min_ta, confirm_dengue)
 """
 
+import warnings
+
 import pandas as pd
+
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 TARGET = "confirm_dengue"
 
 TARGET_LAGS = [1, 2, 3, 7, 14]
 TARGET_ROLL_WINDOWS = [3, 7, 14]
 
-WEATHER_COLS_CANDIDATES = ["ta", "rha", "ra", "max_ta", "min_ta", "ws", "sr"]
+# Full weather variable set as it actually appears in the data.
+# sha = sunshine hours, rha = relative humidity, ra = rainfall, psa = pressure,
+# wsa = wind speed, wd = wind direction, ta = avg temp, da = dew point,
+# max_ta / min_ta = max/min temp.
+WEATHER_COLS_CANDIDATES = ["sha", "rha", "ra", "psa", "wsa", "wd", "ta", "da", "max_ta", "min_ta"]
 WEATHER_LAGS = [1, 2, 3, 7]
 WEATHER_ROLL_WINDOWS = [3, 7, 14]
+
+# Human-readable labels for the UI (with units)
+WEATHER_LABELS = {
+    "sha": "Sunshine hours (hr)",
+    "rha": "Relative humidity (%)",
+    "ra": "Rainfall (mm)",
+    "psa": "Surface pressure (kPa)",
+    "wsa": "Wind speed (m/s)",
+    "wd": "Wind direction (deg)",
+    "ta": "Avg temperature (\u00b0C)",
+    "da": "Dew point (\u00b0C)",
+    "max_ta": "Max temperature (\u00b0C)",
+    "min_ta": "Min temperature (\u00b0C)",
+}
 
 
 def load_data(csv_path_or_buffer, target: str = TARGET) -> pd.DataFrame:
@@ -79,8 +107,9 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     the single latest row aligned to `feature_cols` (the exact column order
     the production model was trained on).
 
-    Returns (row_df, last_date, warnings) — warnings lists any requested
-    feature_cols not found (e.g. if a weather column is missing from new data).
+    Returns (row_df, last_date, missing) — missing lists any requested
+    feature_cols not found (e.g. if a weather column is absent from the
+    current data / wasn't in this dataset when the model was trained).
     """
     df_feat = add_features(df_raw, target=target)
     df_feat_clean = df_feat.dropna()
@@ -98,3 +127,27 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     row = last_row.reindex(columns=feature_cols)  # missing -> NaN, order enforced
 
     return row, last_date, missing
+
+
+def monthly_climatology(df_raw: pd.DataFrame, weather_cols: list) -> pd.DataFrame:
+    """Historical average of each weather variable, grouped by calendar month
+    (1-12), computed from all available history. Used to auto-fill a new
+    day's weather entry when the user doesn't have today's reading yet."""
+    cols_present = [c for c in weather_cols if c in df_raw.columns]
+    if not cols_present:
+        return pd.DataFrame()
+    return df_raw.groupby(df_raw.index.month)[cols_present].mean()
+
+
+def autofill_weather_for_date(df_raw: pd.DataFrame, target_date, weather_cols: list) -> dict:
+    """Return {col: historical_monthly_avg} for the month of target_date,
+    using all data currently in df_raw. Empty dict if no history exists yet
+    for that month or no weather columns are present."""
+    clim = monthly_climatology(df_raw, weather_cols)
+    if clim.empty:
+        return {}
+    month = pd.Timestamp(target_date).month
+    if month not in clim.index:
+        return {}
+    row = clim.loc[month]
+    return {c: float(row[c]) for c in row.index if pd.notna(row[c])}
