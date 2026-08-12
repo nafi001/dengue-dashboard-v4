@@ -281,7 +281,6 @@ else:
     meta = load_metadata()
     st.sidebar.success("Models loaded")
     if meta:
-        st.sidebar.markdown(f"**Model:** {meta.get('model', 'GA-SVR')}")
         st.sidebar.markdown(f"**Last trained on data through:** {meta.get('last_training_date', '—')}")
 
 st.sidebar.divider()
