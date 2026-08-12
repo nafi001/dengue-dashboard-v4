@@ -1,5 +1,5 @@
 """
-Dengue Forecasting Dashboard — Continuous Forecasting (SVR)
+Dengue Forecasting Dashboard — Continuous Forecasting (GA-SVR)
 ================================================================
 Streamlit app for decision makers. Loads production models trained by
 train_ga_svr_dashboard.py, lets the user add daily data via input boxes
@@ -274,6 +274,7 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
 # UI — SIDEBAR
 # --------------------------------------------------------------------------
 st.sidebar.title("🦟 Dengue Forecast")
+st.sidebar.caption("GA-SVR continuous forecasting dashboard")
 
 if not artifacts_available():
     st.sidebar.error("Model artifacts not found in `dashboard_artifacts/`.")
@@ -281,6 +282,7 @@ else:
     meta = load_metadata()
     st.sidebar.success("Models loaded")
     if meta:
+        st.sidebar.markdown(f"**Model:** {meta.get('model', 'GA-SVR')}")
         st.sidebar.markdown(f"**Last trained on data through:** {meta.get('last_training_date', '—')}")
 
 st.sidebar.divider()
@@ -296,10 +298,26 @@ if "autofill_values" not in st.session_state:
 
 entry_date = st.sidebar.date_input("Date", value=pd.Timestamp.today().normalize())
 
+today = pd.Timestamp.today().normalize().date()
+if entry_date > today:
+    days_ahead = (entry_date - today).days
+    st.sidebar.warning(
+        f"⚠️ This date is {days_ahead} day(s) in the future. If that's not "
+        "intentional, double-check the date picker before submitting."
+    )
+if not live_df.empty and pd.Timestamp(entry_date) in live_df.index:
+    existing_val = live_df.loc[pd.Timestamp(entry_date), TARGET]
+    st.sidebar.info(
+        f"A row for **{entry_date}** already exists (confirmed cases: "
+        f"**{int(existing_val)}**). Submitting will overwrite it."
+    )
+
 autofill_clicked = st.sidebar.button(
-    "🌦️ Autofill weather (historical monthly avg)",
-    help="Fills the weather boxes below using the average of each variable "
-         "for this calendar month, computed from the data currently loaded.",
+    "🌦️ Autofill weather (historical daily avg)",
+    help="Fills the weather boxes below using the historical average for "
+         "this exact calendar day (e.g. Aug 12th across all prior years) "
+         "computed from the data currently loaded. If that exact day has "
+         "no history yet, uses the nearest day that does.",
     use_container_width=True,
 )
 if autofill_clicked:
@@ -313,23 +331,26 @@ if autofill_clicked:
             # rerun and keeps whatever's already in session_state[key] — so
             # value= alone can never update an already-rendered box.
             for k, v in vals.items():
-                st.session_state[f"input_{k}"] = round(float(v), 2)
-            st.sidebar.success(f"Filled {len(vals)} variable(s) from month-{pd.Timestamp(entry_date).month} history.")
+                st.session_state[f"input_{k}"] = round(float(v), 4)
+            st.sidebar.success(
+                f"Filled {len(vals)} variable(s) using {pd.Timestamp(entry_date).strftime('%b %d')}'s "
+                "historical average (or nearest available day)."
+            )
             st.rerun()
         else:
-            st.sidebar.warning("No historical data for this month yet.")
+            st.sidebar.warning("No historical weather data available yet to average from.")
 
 with st.sidebar.form("manual_entry"):
     confirm_dengue = st.number_input("Confirmed dengue cases", min_value=0, step=1)
 
-    st.caption("Weather (leave 0.0 / click Autofill above to use monthly history)")
+    st.caption("Weather (leave 0.0 / click Autofill above to use historical daily average)")
     weather_inputs = {}
     c1, c2 = st.columns(2)
     weather_keys = list(WEATHER_LABELS.items())
     for i, (key, label) in enumerate(weather_keys):
         col = c1 if i % 2 == 0 else c2
         weather_inputs[key] = col.number_input(
-            label, value=0.0, format="%.2f", key=f"input_{key}"
+            label, value=0.0, format="%.4f", key=f"input_{key}"
         )
 
     submitted = st.form_submit_button("Add / update row", use_container_width=True)
@@ -342,6 +363,37 @@ if submitted:
         st.session_state.pop(f"input_{k}", None)
     st.sidebar.success(f"Row for {entry_date} saved. Dataset now has {len(live_df)} rows.")
     st.rerun()
+
+st.sidebar.divider()
+with st.sidebar.expander("Delete a row"):
+    if live_df.empty:
+        st.caption("No data loaded yet.")
+    else:
+        delete_date = st.date_input(
+            "Date to delete",
+            value=live_df.index.max().date(),
+            min_value=live_df.index.min().date(),
+            max_value=live_df.index.max().date(),
+            key="delete_date_picker",
+        )
+        delete_ts = pd.Timestamp(delete_date)
+        if delete_ts in live_df.index:
+            row_preview = live_df.loc[delete_ts]
+            st.caption(
+                f"Confirmed cases on {delete_date}: **{int(row_preview[TARGET])}**"
+            )
+            confirm_delete = st.checkbox(
+                f"I understand this permanently removes the {delete_date} row",
+                key="confirm_delete_checkbox",
+            )
+            if st.button("🗑️ Delete this row", disabled=not confirm_delete, use_container_width=True):
+                live_df = live_df.drop(index=delete_ts)
+                save_live_data(live_df)
+                st.session_state.pop("confirm_delete_checkbox", None)
+                st.success(f"Deleted row for {delete_date}.")
+                st.rerun()
+        else:
+            st.caption(f"No row exists for {delete_date}.")
 
 st.sidebar.divider()
 with st.sidebar.expander("Bulk upload CSV instead"):
