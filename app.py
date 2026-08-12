@@ -101,12 +101,16 @@ def load_metadata():
 
 
 @st.cache_data(show_spinner=False)
-def load_ga_params(horizon: int):
-    path = ARTIFACT_DIR / f"ga_best_params_h{horizon}.json"
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
+def load_model_params(horizon: int):
+    """Reads hyperparameters saved by either training script:
+    GA-tuned runs save ga_best_params_h{H}.json, fixed-hyperparameter
+    runs save model_params_h{H}.json. Whichever exists is used."""
+    for fname in (f"ga_best_params_h{horizon}.json", f"model_params_h{horizon}.json"):
+        path = ARTIFACT_DIR / fname
+        if path.exists():
+            with open(path) as f:
+                return json.load(f), fname
+    return None, None
 
 
 def artifacts_available() -> bool:
@@ -139,6 +143,13 @@ def append_new_row(df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     row_df["date"] = pd.to_datetime(row_df["date"])
     row_df = row_df.set_index("date")
     row_df.columns = [c.strip().lower() for c in row_df.columns]
+
+    # Auto-derive any calendar columns the original CSV carried (year/month/day)
+    # so manually-added rows don't end up with blanks in columns the model
+    # doesn't use but that were present in the source data.
+    for cal_col, val in [("year", new_date.year), ("month", new_date.month), ("day", new_date.day)]:
+        if cal_col in df.columns:
+            row_df[cal_col] = val
 
     updated = df.copy()
     if new_date in updated.index:
@@ -303,11 +314,13 @@ if not live_df.empty:
         else:
             st.success("No missing dates in the last 14 days.")
 
-        na_cols = last14.columns[last14.isna().any()].tolist()
+        relevant_cols = [TARGET] + [c for c in WEATHER_COLS_CANDIDATES if c in last14.columns]
+        na_cols = [c for c in relevant_cols if last14[c].isna().any()]
         zero_weather = [c for c in WEATHER_COLS_CANDIDATES
                         if c in last14.columns and (last14[c] == 0).any()]
         if na_cols:
-            st.warning(f"Blank values in: {', '.join(na_cols)}")
+            st.warning(f"Blank values in: {', '.join(na_cols)} — these will block the forecast "
+                      "from using recent rows until filled in.")
         if zero_weather:
             st.caption(f"Zero-valued weather entries recently: {', '.join(zero_weather)} "
                       "— confirm these are real readings, not unfilled boxes.")
@@ -586,7 +599,8 @@ with tab_model:
     if meta:
         st.json(meta)
     for h in HORIZONS:
-        params = load_ga_params(h)
+        params, source_file = load_model_params(h)
         if params:
-            st.markdown(f"**GA-tuned SVR params, H={h}:**")
+            label = "GA-tuned" if source_file and source_file.startswith("ga_best") else "Fixed"
+            st.markdown(f"**{label} SVR params, H={h}:**")
             st.json(params)
