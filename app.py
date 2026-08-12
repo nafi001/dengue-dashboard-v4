@@ -274,7 +274,6 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
 # UI — SIDEBAR
 # --------------------------------------------------------------------------
 st.sidebar.title("🦟 Dengue Forecast")
-st.sidebar.caption("GA-SVR continuous forecasting dashboard")
 
 if not artifacts_available():
     st.sidebar.error("Model artifacts not found in `dashboard_artifacts/`.")
@@ -282,7 +281,6 @@ else:
     meta = load_metadata()
     st.sidebar.success("Models loaded")
     if meta:
-        st.sidebar.markdown(f"**Model:** {meta.get('model', 'GA-SVR')}")
         st.sidebar.markdown(f"**Last trained on data through:** {meta.get('last_training_date', '—')}")
 
 st.sidebar.divider()
