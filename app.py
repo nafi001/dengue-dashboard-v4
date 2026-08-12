@@ -4,20 +4,20 @@ Dengue Forecasting Dashboard — Continuous Forecasting (GA-SVR)
 Streamlit app for decision makers. Loads production models trained by
 train_ga_svr_dashboard.py, lets the user add daily data via input boxes
 (with a one-click historical-average autofill for weather), and
-regenerates the 7-day / 28-day forecast using the latest features.
+regenerates the 7-day / 14-day forecast using the latest features.
 
 Directory layout expected (relative to this file):
     app.py
     features.py
     dashboard_artifacts/
         production_model_h7.pkl
-        production_model_h28.pkl
+        production_model_h14.pkl
         feature_columns_h7.json
-        feature_columns_h28.json
+        feature_columns_h14.json
         residual_std_h7.csv
-        residual_std_h28.csv
+        residual_std_h14.csv
         ga_best_params_h7.json
-        ga_best_params_h28.json
+        ga_best_params_h14.json
         model_metadata.json
     data/
         current_data.csv      <- the "live" dataset the app reads/appends to
@@ -53,7 +53,7 @@ DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 LIVE_DATA_PATH = DATA_DIR / "current_data.csv"
 
-HORIZONS = [7, 28]
+HORIZONS = [7, 14]
 CONF_Z = 1.645  # ~90% interval using residual std (normal approx)
 
 st.set_page_config(
@@ -111,6 +111,16 @@ def load_model_params(horizon: int):
             with open(path) as f:
                 return json.load(f), fname
     return None, None
+
+
+@st.cache_data(show_spinner=False)
+def load_step_metrics(horizon: int):
+    """Reads step-level test metrics (step, mae, rmse, r2) saved by the
+    training script as step_metrics_h{H}.csv, if present."""
+    path = ARTIFACT_DIR / f"step_metrics_h{horizon}.csv"
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
 
 
 def artifacts_available() -> bool:
@@ -335,8 +345,8 @@ if live_df.empty:
     st.info("👈 Add today's data or upload a CSV in the sidebar to get started.")
     st.stop()
 
-tab_overview, tab_forecast, tab_corr, tab_model = st.tabs(
-    ["📊 Overview", "🔮 Forecast", "🔗 Weather correlation", "⚙️ Model info"]
+tab_overview, tab_forecast, tab_corr, tab_reliability, tab_model = st.tabs(
+    ["📊 Overview", "🔮 Forecast", "🔗 Weather correlation", "📈 Model reliability", "⚙️ Model info"]
 )
 
 # ---- OVERVIEW TAB ---------------------------------------------------------
@@ -591,6 +601,67 @@ with tab_corr:
             )
             ts_fig.update_layout(height=520, margin=dict(t=40, b=20), hovermode="x unified", showlegend=False)
             st.plotly_chart(ts_fig, use_container_width=True)
+
+# ---- MODEL RELIABILITY TAB -----------------------------------------------
+with tab_reliability:
+    st.subheader("Forecast reliability by step-ahead")
+    st.caption(
+        "How accurate the model was on held-out test data at each individual "
+        "day of the forecast horizon (step 1 = tomorrow, step 7 = a week out, "
+        "etc.). Lower MAE/RMSE and higher R\u00b2 mean a more reliable step."
+    )
+
+    metrics_by_h = {h: load_step_metrics(h) for h in HORIZONS}
+    available = {h: df for h, df in metrics_by_h.items() if df is not None}
+
+    if not available:
+        st.info(
+            "No `step_metrics_h{H}.csv` files found in `dashboard_artifacts/`. "
+            "These are produced by the training script's per-step evaluation "
+            "loop \u2014 save one CSV per horizon with columns `step, mae, rmse, r2` "
+            "and this tab will pick them up automatically."
+        )
+    else:
+        missing = [h for h in HORIZONS if h not in available]
+        if missing:
+            st.warning(f"Missing step metrics for horizon(s): {missing} "
+                      f"\u2014 showing what's available.")
+
+        colors = {7: "#4C9AFF", 14: "#E5484D", 28: "#F5A623"}
+
+        metric_tabs = st.tabs(["MAE", "RMSE", "R\u00b2"])
+        metric_specs = [("mae", "Mean Absolute Error (cases)"), ("rmse", "RMSE (cases)"), ("r2", "R\u00b2")]
+
+        for mtab, (col, ylabel) in zip(metric_tabs, metric_specs):
+            with mtab:
+                fig = go.Figure()
+                for h, df in available.items():
+                    fig.add_trace(go.Scatter(
+                        x=df["step"], y=df[col], mode="lines+markers",
+                        name=f"H={h}", line=dict(color=colors.get(h)),
+                    ))
+                if col == "r2":
+                    fig.add_hline(y=0, line_color="gray", line_width=1, line_dash="dot")
+                fig.update_layout(
+                    height=380, margin=dict(t=20, b=20),
+                    xaxis_title="Step ahead (days)", yaxis_title=ylabel,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.subheader("Summary")
+        summary_rows = []
+        for h, df in available.items():
+            summary_rows.append({
+                "Horizon": f"H={h}",
+                "Mean MAE": round(df["mae"].mean(), 2),
+                "Mean RMSE": round(df["rmse"].mean(), 2),
+                "Mean R\u00b2": round(df["r2"].mean(), 3),
+                "Best step (by R\u00b2)": int(df.loc[df["r2"].idxmax(), "step"]),
+                "Worst step (by R\u00b2)": int(df.loc[df["r2"].idxmin(), "step"]),
+            })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
 # ---- MODEL INFO TAB ----------------------------------------------------
 with tab_model:
