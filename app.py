@@ -1,5 +1,5 @@
 """
-Dengue Forecasting Dashboard — Continuous Forecasting (GA-SVR)
+Dengue Forecasting Dashboard — Continuous Forecasting (SVR)
 ================================================================
 Streamlit app for decision makers. Loads production models trained by
 train_ga_svr_dashboard.py, lets the user add daily data via input boxes
@@ -274,7 +274,6 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
 # UI — SIDEBAR
 # --------------------------------------------------------------------------
 st.sidebar.title("🦟 Dengue Forecast")
-st.sidebar.caption("GA-SVR continuous forecasting dashboard")
 
 if not artifacts_available():
     st.sidebar.error("Model artifacts not found in `dashboard_artifacts/`.")
@@ -464,12 +463,6 @@ with tab_overview:
 
     # ---------------- FORECAST ----------------
     st.subheader("🔮 14-day forecast")
-    st.caption(
-        "Days 1–7 come from the model trained specifically for near-term accuracy; "
-        "days 8–14 extend the outlook using the longer-horizon model. Each date "
-        "shows exactly one number, so there's no disagreement between models to "
-        "reconcile."
-    )
 
     if not artifacts_available():
         st.warning("No trained model artifacts found. Run the training script first and commit "
@@ -549,7 +542,6 @@ with tab_overview:
                 fc_table = pd.DataFrame({
                     "Date": [d.date() for d in blended["dates"]],
                     "Forecast": np.round(blended["pred"], 1),
-                    "Source": blended["source"],
                 })
                 if blended["lower"] is not None:
                     fc_table[f"Lower (~{conf_level}%)"] = np.round(blended["lower"], 1)
@@ -587,24 +579,34 @@ with tab_overview:
     if len(years_present) >= 2:
         st.subheader("Year-over-year comparison")
         st.caption(
-            "Each year plotted by day-of-year, so seasons line up regardless of "
-            "which calendar year they fell in — makes it easy to see if this "
-            "year is running above, below, or in line with previous years."
+            "Each year plotted against the same Jan\u2013Dec calendar axis, so "
+            "seasons line up regardless of which calendar year they fell in \u2014 "
+            "makes it easy to see if this year is running above, below, or in "
+            "line with previous years."
         )
         yoy_default = years_present[-3:] if len(years_present) > 3 else years_present
         yoy_years = st.multiselect("Years to compare", years_present, default=yoy_default)
         if yoy_years:
             yfig = go.Figure()
+            # Map every year onto a single common reference year (a leap year,
+            # so Feb 29 always has somewhere to go) so the x-axis shows real
+            # calendar dates ("Jan 15", "Feb 1"...) instead of raw day-of-year
+            # numbers, while still overlaying different years on one axis.
+            REF_YEAR = 2020
             for yr in sorted(yoy_years):
                 yr_data = live_df[live_df.index.year == yr]
+                ref_dates = pd.to_datetime({
+                    "year": REF_YEAR, "month": yr_data.index.month, "day": yr_data.index.day
+                })
                 yfig.add_trace(go.Scatter(
-                    x=yr_data.index.dayofyear, y=yr_data[TARGET],
+                    x=ref_dates, y=yr_data[TARGET].values,
                     mode="lines", name=str(yr),
                     line=dict(width=2.5 if yr == latest_date.year else 1.5),
                 ))
             yfig.update_layout(
                 height=400, margin=dict(t=20, b=20), hovermode="x unified",
-                xaxis_title="Day of year", yaxis_title="Confirmed dengue cases",
+                xaxis_title="Date (month/day)", yaxis_title="Confirmed dengue cases",
+                xaxis=dict(tickformat="%b %d"),
             )
             st.plotly_chart(yfig, use_container_width=True)
 
