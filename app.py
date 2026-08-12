@@ -2,9 +2,9 @@
 Dengue Forecasting Dashboard — Continuous Forecasting (GA-SVR)
 ================================================================
 Streamlit app for decision makers. Loads production models trained by
-train_ga_svr_dashboard.py, lets the user upload/append daily data, and
-regenerates the forecast (7-day and 28-day horizons) using the latest
-autoregressive + weather features.
+train_ga_svr_dashboard.py, lets the user add daily data via input boxes
+(with a one-click historical-average autofill for weather), and
+regenerates the 7-day / 28-day forecast using the latest features.
 
 Directory layout expected (relative to this file):
     app.py
@@ -21,10 +21,6 @@ Directory layout expected (relative to this file):
         model_metadata.json
     data/
         current_data.csv      <- the "live" dataset the app reads/appends to
-
-Run locally:
-    pip install -r requirements.txt
-    streamlit run app.py
 """
 
 import json
@@ -35,9 +31,18 @@ import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
-from features import TARGET, add_features, build_latest_feature_row, load_data
+from features import (
+    TARGET,
+    WEATHER_COLS_CANDIDATES,
+    WEATHER_LABELS,
+    add_features,
+    autofill_weather_for_date,
+    build_latest_feature_row,
+    load_data,
+)
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -203,19 +208,63 @@ else:
         st.sidebar.markdown(f"**Last trained on data through:** {meta.get('last_training_date', '—')}")
 
 st.sidebar.divider()
-st.sidebar.subheader("1. Update data")
-
-data_mode = st.sidebar.radio(
-    "How do you want to update the dataset?",
-    ["Upload a CSV (replace/merge)", "Add today's row manually"],
-    label_visibility="collapsed",
-)
+st.sidebar.subheader("Add today's data")
 
 live_df = get_live_data()
+weather_cols_present_in_data = [c for c in WEATHER_COLS_CANDIDATES if live_df.empty or c in live_df.columns] \
+    if not live_df.empty else WEATHER_COLS_CANDIDATES
 
-if data_mode == "Upload a CSV (replace/merge)":
-    uploaded = st.sidebar.file_uploader("CSV with Date + confirm_dengue + weather cols", type=["csv"])
-    merge_mode = st.sidebar.radio("If data already loaded:", ["Replace entirely", "Merge (append/overwrite by date)"])
+# Track autofilled values across the date-picker changing, via session_state
+if "autofill_values" not in st.session_state:
+    st.session_state["autofill_values"] = {}
+
+entry_date = st.sidebar.date_input("Date", value=pd.Timestamp.today().normalize())
+
+autofill_clicked = st.sidebar.button(
+    "🌦️ Autofill weather (historical monthly avg)",
+    help="Fills the weather boxes below using the average of each variable "
+         "for this calendar month, computed from the data currently loaded.",
+    use_container_width=True,
+)
+if autofill_clicked:
+    if live_df.empty:
+        st.sidebar.warning("No historical data loaded yet — nothing to average.")
+    else:
+        vals = autofill_weather_for_date(live_df, entry_date, WEATHER_COLS_CANDIDATES)
+        if vals:
+            st.session_state["autofill_values"] = vals
+            st.sidebar.success(f"Filled {len(vals)} variable(s) from month-{pd.Timestamp(entry_date).month} history.")
+        else:
+            st.sidebar.warning("No historical data for this month yet.")
+
+with st.sidebar.form("manual_entry"):
+    confirm_dengue = st.number_input("Confirmed dengue cases", min_value=0, step=1)
+
+    st.caption("Weather (leave 0.0 / click Autofill above to use monthly history)")
+    af = st.session_state.get("autofill_values", {})
+    weather_inputs = {}
+    c1, c2 = st.columns(2)
+    weather_keys = list(WEATHER_LABELS.items())
+    for i, (key, label) in enumerate(weather_keys):
+        col = c1 if i % 2 == 0 else c2
+        weather_inputs[key] = col.number_input(
+            label, value=float(af.get(key, 0.0)), format="%.2f", key=f"input_{key}"
+        )
+
+    submitted = st.form_submit_button("Add / update row", use_container_width=True)
+
+if submitted:
+    new_row = {"date": entry_date, "confirm_dengue": confirm_dengue, **weather_inputs}
+    live_df = append_new_row(live_df if not live_df.empty else pd.DataFrame(), new_row)
+    save_live_data(live_df)
+    st.session_state["autofill_values"] = {}
+    st.sidebar.success(f"Row for {entry_date} saved. Dataset now has {len(live_df)} rows.")
+    st.rerun()
+
+st.sidebar.divider()
+with st.sidebar.expander("Bulk upload CSV instead"):
+    uploaded = st.file_uploader("CSV with Date + confirm_dengue + weather cols", type=["csv"])
+    merge_mode = st.radio("If data already loaded:", ["Replace entirely", "Merge (append/overwrite by date)"])
     if uploaded is not None:
         try:
             new_df = load_data(uploaded)
@@ -225,36 +274,10 @@ if data_mode == "Upload a CSV (replace/merge)":
                 live_df = pd.concat([live_df, new_df])
                 live_df = live_df[~live_df.index.duplicated(keep="last")].sort_index()
             save_live_data(live_df)
-            st.sidebar.success(f"Loaded {len(new_df)} rows. Dataset now has {len(live_df)} rows.")
+            st.success(f"Loaded {len(new_df)} rows. Dataset now has {len(live_df)} rows.")
+            st.rerun()
         except Exception as e:
-            st.sidebar.error(f"Could not load CSV: {e}")
-
-else:
-    st.sidebar.caption("Enter today's confirmed cases and weather readings.")
-    with st.sidebar.form("manual_entry"):
-        entry_date = st.date_input("Date", value=pd.Timestamp.today().normalize())
-        confirm_dengue = st.number_input("Confirmed dengue cases", min_value=0, step=1)
-        c1, c2 = st.columns(2)
-        with c1:
-            ta = st.number_input("Avg temp (ta)", value=0.0, format="%.2f")
-            rha = st.number_input("Rel. humidity (rha)", value=0.0, format="%.2f")
-            ra = st.number_input("Rainfall (ra)", value=0.0, format="%.2f")
-            max_ta = st.number_input("Max temp (max_ta)", value=0.0, format="%.2f")
-        with c2:
-            min_ta = st.number_input("Min temp (min_ta)", value=0.0, format="%.2f")
-            ws = st.number_input("Wind speed (ws)", value=0.0, format="%.2f")
-            sr = st.number_input("Solar radiation (sr)", value=0.0, format="%.2f")
-        submitted = st.form_submit_button("Add / update row")
-
-    if submitted:
-        new_row = {
-            "date": entry_date, "confirm_dengue": confirm_dengue,
-            "ta": ta, "rha": rha, "ra": ra, "max_ta": max_ta,
-            "min_ta": min_ta, "ws": ws, "sr": sr,
-        }
-        live_df = append_new_row(live_df if not live_df.empty else pd.DataFrame(), new_row)
-        save_live_data(live_df)
-        st.sidebar.success(f"Row for {entry_date} saved. Dataset now has {len(live_df)} rows.")
+            st.error(f"Could not load CSV: {e}")
 
 st.sidebar.divider()
 if not live_df.empty:
@@ -270,11 +293,11 @@ st.title("Dengue Forecasting Dashboard")
 st.caption("Decision-support view — descriptive trends, current risk, and forward-looking forecasts.")
 
 if live_df.empty:
-    st.info("👈 Upload a CSV or add today's row in the sidebar to get started.")
+    st.info("👈 Add today's data or upload a CSV in the sidebar to get started.")
     st.stop()
 
-tab_overview, tab_forecast, tab_data, tab_model = st.tabs(
-    ["📊 Overview", "🔮 Forecast", "📁 Data", "⚙️ Model info"]
+tab_overview, tab_forecast, tab_corr, tab_model = st.tabs(
+    ["📊 Overview", "🔮 Forecast", "🔗 Weather correlation", "⚙️ Model info"]
 )
 
 # ---- OVERVIEW TAB ---------------------------------------------------------
@@ -295,7 +318,8 @@ with tab_overview:
     col4.metric("Days of data", len(live_df))
 
     st.subheader("Case trend")
-    window = st.select_slider("Show last N days", options=[30, 60, 90, 180, 365, len(live_df)], value=min(90, len(live_df)))
+    window_options = sorted(set([30, 60, 90, 180, 365, len(live_df)]))
+    window = st.select_slider("Show last N days", options=window_options, value=min(90, len(live_df)))
     recent = live_df.tail(window)
 
     fig = go.Figure()
@@ -305,18 +329,33 @@ with tab_overview:
             x=recent.index, y=recent[TARGET].rolling(7).mean(),
             mode="lines", name="7-day rolling mean", line=dict(dash="dash"),
         ))
-    fig.update_layout(height=400, margin=dict(t=20, b=20), hovermode="x unified")
+    fig.update_layout(height=380, margin=dict(t=20, b=20), hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    weather_present = [c for c in ["ta", "rha", "ra", "max_ta", "min_ta", "ws", "sr"] if c in live_df.columns]
+    weather_present = [c for c in WEATHER_COLS_CANDIDATES if c in live_df.columns]
     if weather_present:
         st.subheader("Weather conditions")
-        wsel = st.multiselect("Show variables", weather_present, default=weather_present[:2])
+        st.caption("Each variable in its own subplot — units differ (°C, %, mm, hPa, m/s, hours, degrees), so they aren't comparable on one shared axis.")
+        wsel = st.multiselect(
+            "Show variables",
+            weather_present,
+            default=weather_present[:4],
+            format_func=lambda c: WEATHER_LABELS.get(c, c),
+        )
         if wsel:
-            wfig = go.Figure()
-            for w in wsel:
-                wfig.add_trace(go.Scatter(x=recent.index, y=recent[w], mode="lines", name=w))
-            wfig.update_layout(height=320, margin=dict(t=20, b=20), hovermode="x unified")
+            n = len(wsel)
+            wfig = make_subplots(
+                rows=n, cols=1, shared_xaxes=True,
+                subplot_titles=[WEATHER_LABELS.get(c, c) for c in wsel],
+                vertical_spacing=min(0.08, 1.0 / max(n * 2, 1)),
+            )
+            for i, w in enumerate(wsel, start=1):
+                wfig.add_trace(
+                    go.Scatter(x=recent.index, y=recent[w], mode="lines", name=WEATHER_LABELS.get(w, w),
+                               showlegend=False, line=dict(width=1.8)),
+                    row=i, col=1,
+                )
+            wfig.update_layout(height=220 * n, margin=dict(t=40, b=20), hovermode="x unified")
             st.plotly_chart(wfig, use_container_width=True)
 
 # ---- FORECAST TAB ----------------------------------------------------------
@@ -390,15 +429,119 @@ with tab_forecast:
         else:
             st.info("Click **Regenerate forecast** to run the models on the current dataset.")
 
-# ---- DATA TAB ---------------------------------------------------------
-with tab_data:
-    st.subheader("Current dataset")
-    st.dataframe(live_df.reset_index(), use_container_width=True, height=450)
-    st.caption(
-        "This is the dataset the forecast is generated from. Add new rows via the sidebar "
-        "(upload or manual entry) — the forecast tab always uses the most recent row as the "
-        "starting point for the autoregressive features."
-    )
+# ---- WEATHER CORRELATION TAB ---------------------------------------------
+with tab_corr:
+    weather_present = [c for c in WEATHER_COLS_CANDIDATES if c in live_df.columns]
+
+    if not weather_present:
+        st.info("No weather columns found in the current dataset.")
+    else:
+        st.subheader("Lagged correlation: weather variable vs. dengue cases")
+        st.caption(
+            "Pick a weather variable and a lag (days earlier than the case count) to see "
+            "how strongly they're related — useful for questions like 'does rainfall "
+            "2 weeks ago predict today's cases?'"
+        )
+
+        cc1, cc2 = st.columns([2, 1])
+        with cc1:
+            corr_var = st.selectbox(
+                "Weather variable", weather_present,
+                format_func=lambda c: WEATHER_LABELS.get(c, c), key="corr_var",
+            )
+        with cc2:
+            corr_lag = st.slider("Lag (days)", min_value=0, max_value=60, value=7, key="corr_lag")
+
+        merged = pd.DataFrame({
+            "weather": live_df[corr_var].shift(corr_lag),
+            "dengue": live_df[TARGET],
+        }).dropna()
+
+        if len(merged) < 3:
+            st.warning("Not enough overlapping data to compute a correlation at this lag.")
+        else:
+            r = merged["weather"].corr(merged["dengue"])
+            scatter_fig = go.Figure()
+            scatter_fig.add_trace(go.Scatter(
+                x=merged["weather"], y=merged["dengue"], mode="markers",
+                marker=dict(size=6, opacity=0.6), name="Days",
+            ))
+            # simple linear trend line
+            if merged["weather"].std() > 0:
+                coeffs = np.polyfit(merged["weather"], merged["dengue"], 1)
+                xs = np.linspace(merged["weather"].min(), merged["weather"].max(), 50)
+                ys = coeffs[0] * xs + coeffs[1]
+                scatter_fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Linear trend", line=dict(color="firebrick", dash="dash")))
+
+            scatter_fig.update_layout(
+                height=420, margin=dict(t=30, b=20),
+                xaxis_title=f"{WEATHER_LABELS.get(corr_var, corr_var)} (lag {corr_lag}d)",
+                yaxis_title="Confirmed dengue cases",
+                title=f"Pearson r = {r:.3f}  (n={len(merged)})",
+            )
+            st.plotly_chart(scatter_fig, use_container_width=True)
+
+            # correlation across a range of lags, for context
+            with st.expander("See correlation across all lags 0–60 days"):
+                lag_range = range(0, 61)
+                rs = []
+                for lg in lag_range:
+                    m = pd.DataFrame({
+                        "weather": live_df[corr_var].shift(lg),
+                        "dengue": live_df[TARGET],
+                    }).dropna()
+                    rs.append(m["weather"].corr(m["dengue"]) if len(m) >= 3 else np.nan)
+                lag_fig = go.Figure()
+                lag_fig.add_trace(go.Bar(x=list(lag_range), y=rs, marker_color="steelblue"))
+                lag_fig.add_hline(y=0, line_color="gray", line_width=1)
+                lag_fig.add_vline(x=corr_lag, line_color="firebrick", line_dash="dash")
+                lag_fig.update_layout(
+                    height=300, margin=dict(t=20, b=20),
+                    xaxis_title="Lag (days)", yaxis_title="Correlation (r)",
+                )
+                st.plotly_chart(lag_fig, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("Time series comparison")
+        st.caption(
+            "Select a date range and weather variable to see the two series stacked — "
+            "weather on top, dengue cases below — to visually inspect how they move together over time."
+        )
+
+        min_date, max_date = live_df.index.min().date(), live_df.index.max().date()
+        default_start = max(min_date, (live_df.index.max() - pd.Timedelta(days=180)).date())
+        ts_var = st.selectbox(
+            "Weather variable", weather_present,
+            format_func=lambda c: WEATHER_LABELS.get(c, c), key="ts_var",
+        )
+        date_range = st.slider(
+            "Date range", min_value=min_date, max_value=max_date,
+            value=(default_start, max_date), key="ts_range",
+        )
+
+        window_df = live_df.loc[str(date_range[0]):str(date_range[1])]
+
+        if window_df.empty:
+            st.warning("No data in the selected range.")
+        else:
+            ts_fig = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                subplot_titles=[WEATHER_LABELS.get(ts_var, ts_var), "Confirmed dengue cases"],
+                vertical_spacing=0.1,
+            )
+            ts_fig.add_trace(
+                go.Scatter(x=window_df.index, y=window_df[ts_var], mode="lines",
+                           name=WEATHER_LABELS.get(ts_var, ts_var), line=dict(color="steelblue")),
+                row=1, col=1,
+            )
+            ts_fig.add_trace(
+                go.Scatter(x=window_df.index, y=window_df[TARGET], mode="lines",
+                           name="Dengue cases", line=dict(color="firebrick")),
+                row=2, col=1,
+            )
+            ts_fig.update_layout(height=520, margin=dict(t=40, b=20), hovermode="x unified", showlegend=False)
+            st.plotly_chart(ts_fig, use_container_width=True)
 
 # ---- MODEL INFO TAB ----------------------------------------------------
 with tab_model:
