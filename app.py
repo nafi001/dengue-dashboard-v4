@@ -232,8 +232,14 @@ if autofill_clicked:
     else:
         vals = autofill_weather_for_date(live_df, entry_date, WEATHER_COLS_CANDIDATES)
         if vals:
-            st.session_state["autofill_values"] = vals
+            # Write straight into each widget's own session_state key.
+            # Once a number_input has a `key`, Streamlit ignores value= on
+            # rerun and keeps whatever's already in session_state[key] — so
+            # value= alone can never update an already-rendered box.
+            for k, v in vals.items():
+                st.session_state[f"input_{k}"] = round(float(v), 2)
             st.sidebar.success(f"Filled {len(vals)} variable(s) from month-{pd.Timestamp(entry_date).month} history.")
+            st.rerun()
         else:
             st.sidebar.warning("No historical data for this month yet.")
 
@@ -241,14 +247,13 @@ with st.sidebar.form("manual_entry"):
     confirm_dengue = st.number_input("Confirmed dengue cases", min_value=0, step=1)
 
     st.caption("Weather (leave 0.0 / click Autofill above to use monthly history)")
-    af = st.session_state.get("autofill_values", {})
     weather_inputs = {}
     c1, c2 = st.columns(2)
     weather_keys = list(WEATHER_LABELS.items())
     for i, (key, label) in enumerate(weather_keys):
         col = c1 if i % 2 == 0 else c2
         weather_inputs[key] = col.number_input(
-            label, value=float(af.get(key, 0.0)), format="%.2f", key=f"input_{key}"
+            label, value=0.0, format="%.2f", key=f"input_{key}"
         )
 
     submitted = st.form_submit_button("Add / update row", use_container_width=True)
@@ -257,7 +262,8 @@ if submitted:
     new_row = {"date": entry_date, "confirm_dengue": confirm_dengue, **weather_inputs}
     live_df = append_new_row(live_df if not live_df.empty else pd.DataFrame(), new_row)
     save_live_data(live_df)
-    st.session_state["autofill_values"] = {}
+    for k in WEATHER_LABELS:
+        st.session_state.pop(f"input_{k}", None)
     st.sidebar.success(f"Row for {entry_date} saved. Dataset now has {len(live_df)} rows.")
     st.rerun()
 
@@ -285,6 +291,26 @@ if not live_df.empty:
     st.sidebar.caption(f"Range: {live_df.index.min().date()} → {live_df.index.max().date()}")
     csv_bytes = live_df.reset_index().to_csv(index=False).encode()
     st.sidebar.download_button("Download current dataset", csv_bytes, "current_data.csv", "text/csv")
+
+    with st.sidebar.expander("Recent data health check"):
+        last14 = live_df.tail(14)
+        full_range = pd.date_range(last14.index.min(), live_df.index.max(), freq="D")
+        missing_dates = full_range.difference(live_df.index)
+        if len(missing_dates) > 0:
+            st.warning(f"{len(missing_dates)} missing date(s) in the last 14 days: "
+                       + ", ".join(d.strftime('%Y-%m-%d') for d in missing_dates[:5])
+                       + (" ..." if len(missing_dates) > 5 else ""))
+        else:
+            st.success("No missing dates in the last 14 days.")
+
+        na_cols = last14.columns[last14.isna().any()].tolist()
+        zero_weather = [c for c in WEATHER_COLS_CANDIDATES
+                        if c in last14.columns and (last14[c] == 0).any()]
+        if na_cols:
+            st.warning(f"Blank values in: {', '.join(na_cols)}")
+        if zero_weather:
+            st.caption(f"Zero-valued weather entries recently: {', '.join(zero_weather)} "
+                      "— confirm these are real readings, not unfilled boxes.")
 
 # --------------------------------------------------------------------------
 # MAIN — TABS
@@ -370,6 +396,8 @@ with tab_forecast:
             "lag and rolling-window features (the biggest contributors) update automatically "
             "every time you add a new day."
         )
+        latest_row_date = live_df.index.max().date()
+        st.caption(f"Latest date in current dataset: **{latest_row_date}**")
 
         if st.button("🔄 Regenerate forecast now", type="primary"):
             st.session_state["run_forecast"] = True
@@ -394,6 +422,14 @@ with tab_forecast:
                     st.warning(
                         "Some weather features the model expects weren't found in the current "
                         f"data columns: {res['missing_weather_cols'][:6]}. Predictions may be degraded."
+                    )
+                if res["as_of"].date() < latest_row_date:
+                    st.warning(
+                        f"⚠️ This forecast is based on data through **{res['as_of'].date()}**, but your "
+                        f"dataset's latest row is **{latest_row_date}**. The gap usually means one or more "
+                        "recent days have missing weather/case values, so the newest rows were dropped "
+                        "when computing lag/rolling features. Check the Data tab for gaps, or fill any "
+                        "missing fields for the newest dates and click Regenerate again."
                     )
                 st.caption(f"Forecast generated from data as of **{res['as_of'].date()}**")
 
