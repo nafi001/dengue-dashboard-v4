@@ -3,7 +3,7 @@
   "model": "Fixed-SVR (RBF kernel, C=100, gamma=scale, eps=0.05, MultiOutputRegressor)",
   "horizons": [
     7,
-    28
+    14
   ],
   "steps_reported": {
     "7": [
@@ -11,13 +11,11 @@
       3,
       7
     ],
-    "28": [
+    "14": [
       1,
       3,
       7,
-      14,
-      21,
-      28
+      14
     ]
   },
   "params_by_horizon": {
@@ -26,15 +24,15 @@
       "gamma": "scale",
       "epsilon": 0.05
     },
-    "28": {
+    "14": {
       "C": 100,
       "gamma": "scale",
       "epsilon": 0.05
     }
   },
   "mean_mae_by_horizon": {
-    "7": 67.44352499398924,
-    "28": 69.70489907401979
+    "7": 70.39231581391121,
+    "14": 73.41071624850979
   },
   "last_training_date": "2026-08-11",
   "n_rows_total": 1684,
@@ -43,6 +41,7 @@
     "residual_std_h{H}.csv",
     "feature_columns_h{H}.json",
     "model_params_h{H}.json",
-    "latest_feature_row_h{H}.csv"
+    "latest_feature_row_h{H}.csv",
+    "step_metrics_h{H}.csv"
   ]
 }
