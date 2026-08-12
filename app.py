@@ -351,20 +351,57 @@ tab_overview, tab_forecast, tab_corr, tab_reliability, tab_model = st.tabs(
 
 # ---- OVERVIEW TAB ---------------------------------------------------------
 with tab_overview:
-    col1, col2, col3, col4 = st.columns(4)
     latest_val = live_df[TARGET].iloc[-1]
     latest_date = live_df.index[-1]
-    prev_7 = live_df[TARGET].iloc[-8:-1].mean() if len(live_df) > 8 else np.nan
-    trend_7 = latest_val - prev_7 if pd.notna(prev_7) else np.nan
+
+    # 7-day vs prior 7-day trend, as a percentage (more decision-legible than a raw delta)
+    last_7 = live_df[TARGET].iloc[-7:].mean() if len(live_df) >= 7 else np.nan
+    prev_7 = live_df[TARGET].iloc[-14:-7].mean() if len(live_df) >= 14 else np.nan
+    if pd.notna(last_7) and pd.notna(prev_7) and prev_7 > 0:
+        pct_change_7 = (last_7 - prev_7) / prev_7 * 100
+    else:
+        pct_change_7 = np.nan
+
+    # 14-day cumulative burden — smooths day-to-day noise, shows recent load
+    cum_14 = live_df[TARGET].iloc[-14:].sum() if len(live_df) >= 14 else live_df[TARGET].sum()
+
+    # Same-month historical average — is this month running hot or normal for the season?
+    current_month = latest_date.month
+    hist_mask = (live_df.index.month == current_month) & (live_df.index.year < latest_date.year)
+    hist_month_avg = live_df.loc[hist_mask, TARGET].mean() if hist_mask.any() else np.nan
+    if pd.notna(hist_month_avg) and hist_month_avg > 0:
+        vs_seasonal_pct = (last_7 - hist_month_avg) / hist_month_avg * 100 if pd.notna(last_7) else np.nan
+    else:
+        vs_seasonal_pct = np.nan
+
+    col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("Latest confirmed cases", int(latest_val), help=f"As of {latest_date.date()}")
+
     col2.metric(
-        "7-day avg change",
-        f"{trend_7:+.1f}" if pd.notna(trend_7) else "—",
-        delta=f"{trend_7:+.1f}" if pd.notna(trend_7) else None,
+        "7-day trend",
+        f"{pct_change_7:+.0f}%" if pd.notna(pct_change_7) else "—",
+        delta=f"{pct_change_7:+.0f}% vs prior week" if pd.notna(pct_change_7) else None,
+        delta_color="inverse",  # rising cases = bad, so red for positive
+        help="Average daily cases this week vs. the week before.",
     )
-    col3.metric("Total in dataset", int(live_df[TARGET].sum()))
-    col4.metric("Days of data", len(live_df))
+
+    col3.metric(
+        "14-day cumulative cases",
+        int(cum_14),
+        help="Total confirmed cases over the last 14 days — smooths daily noise, shows recent burden.",
+    )
+
+    col4.metric(
+        "Vs. seasonal average",
+        f"{vs_seasonal_pct:+.0f}%" if pd.notna(vs_seasonal_pct) else "—",
+        delta=f"{vs_seasonal_pct:+.0f}% vs typical {latest_date.strftime('%B')}" if pd.notna(vs_seasonal_pct) else None,
+        delta_color="inverse",
+        help=f"This week's average vs. the historical average for {latest_date.strftime('%B')} "
+             "in prior years — a quick read on whether this is a normal season or an unusual spike."
+             if pd.notna(vs_seasonal_pct) else
+             "Needs at least one prior year of data for this month to compute.",
+    )
 
     st.subheader("Case trend")
     window_options = sorted(set([30, 60, 90, 180, 365, len(live_df)]))
