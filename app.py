@@ -174,7 +174,7 @@ def generate_forecast(df_raw: pd.DataFrame, horizon: int, conf_z: float = CONF_Z
     if model is None or feature_cols is None:
         return None
 
-    row, last_date, missing = build_latest_feature_row(df_raw, feature_cols)
+    row, last_date, missing, dropped_reason = build_latest_feature_row(df_raw, feature_cols)
 
     if row.isna().any(axis=None):
         na_cols = row.columns[row.isna().any()].tolist()
@@ -203,6 +203,7 @@ def generate_forecast(df_raw: pd.DataFrame, horizon: int, conf_z: float = CONF_Z
         "upper": upper,
         "as_of": last_date,
         "missing_weather_cols": missing,
+        "dropped_reason": dropped_reason,
     }
 
 
@@ -258,15 +259,32 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
         as_of_14 = None
         warnings.append("14-day model artifacts not found — showing 7-day forecast only.")
 
+    pred_arr = np.array(pred, dtype=float)
+    lower_arr = np.array(lower, dtype=float) if lower is not None else None
+    upper_arr = np.array(upper, dtype=float) if upper is not None else None
+
+    # Known reporting artifact: confirmed-case counts are systematically
+    # under/over-reported on Fridays in the source data. Halve the forecast
+    # (and both interval bounds, so the band stays proportionally correct)
+    # for any date that falls on a Friday. This is a display-layer
+    # correction only — it never touches the trained model or its inputs.
+    friday_mask = np.array([d.weekday() == 4 for d in dates])
+    pred_arr[friday_mask] = pred_arr[friday_mask] / 2
+    if lower_arr is not None:
+        lower_arr[friday_mask] = lower_arr[friday_mask] / 2
+    if upper_arr is not None:
+        upper_arr[friday_mask] = upper_arr[friday_mask] / 2
+
     return {
         "dates": dates,
-        "pred": np.array(pred),
-        "lower": np.array(lower) if lower is not None else None,
-        "upper": np.array(upper) if upper is not None else None,
+        "pred": pred_arr,
+        "lower": lower_arr,
+        "upper": upper_arr,
         "source": source,
         "as_of_7": res7["as_of"],
         "as_of_14": as_of_14,
         "warnings": warnings,
+        "friday_adjusted": [d.date() for d, is_fri in zip(dates, friday_mask) if is_fri],
     }
 
 
@@ -274,6 +292,7 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
 # UI — SIDEBAR
 # --------------------------------------------------------------------------
 st.sidebar.title("🦟 Dengue Forecast")
+st.sidebar.caption("GA-SVR continuous forecasting dashboard")
 
 if not artifacts_available():
     st.sidebar.error("Model artifacts not found in `dashboard_artifacts/`.")
@@ -281,6 +300,7 @@ else:
     meta = load_metadata()
     st.sidebar.success("Models loaded")
     if meta:
+        st.sidebar.markdown(f"**Model:** {meta.get('model', 'GA-SVR')}")
         st.sidebar.markdown(f"**Last trained on data through:** {meta.get('last_training_date', '—')}")
 
 st.sidebar.divider()
@@ -546,6 +566,14 @@ with tab_overview:
                 for w in blended["warnings"]:
                     st.warning(w)
 
+                if blended.get("friday_adjusted"):
+                    fri_list = ", ".join(d.strftime("%b %d") for d in blended["friday_adjusted"])
+                    st.info(
+                        f"ℹ️ Friday values ({fri_list}) are shown at half the model's raw "
+                        "prediction, correcting for known under/over-reporting of confirmed "
+                        "cases on Fridays in the source data."
+                    )
+
                 stale_dates = []
                 if blended["as_of_7"].date() < latest_row_date:
                     stale_dates.append(f"7-day model (as of {blended['as_of_7'].date()})")
@@ -587,6 +615,43 @@ with tab_overview:
                     ))
                 ffig.update_layout(height=400, margin=dict(t=20, b=20), hovermode="x unified")
                 st.plotly_chart(ffig, use_container_width=True)
+
+                # ---------------- FORECAST SUMMARY KPIs ----------------
+                total_14 = blended["pred"].sum()
+                avg_daily = blended["pred"].mean()
+                peak_idx = int(np.argmax(blended["pred"]))
+                peak_val = blended["pred"][peak_idx]
+                peak_date = blended["dates"][peak_idx]
+
+                last_14_actual = live_df[TARGET].tail(14).sum()
+                if last_14_actual > 0:
+                    vs_last_14_pct = (total_14 - last_14_actual) / last_14_actual * 100
+                else:
+                    vs_last_14_pct = np.nan
+
+                kcol1, kcol2, kcol3, kcol4 = st.columns(4)
+                kcol1.metric(
+                    "Total forecasted (14d)", f"{total_14:.0f}",
+                    help="Sum of the daily forecast across all 14 days.",
+                )
+                kcol2.metric(
+                    "Avg daily forecast", f"{avg_daily:.1f}",
+                    help="Mean of the 14 daily forecast values.",
+                )
+                kcol3.metric(
+                    "Peak day", f"{peak_val:.0f}",
+                    delta=peak_date.strftime("%b %d"),
+                    delta_color="off",
+                    help="Highest single-day forecast and its date.",
+                )
+                kcol4.metric(
+                    "Vs. last 14 actual days",
+                    f"{vs_last_14_pct:+.0f}%" if pd.notna(vs_last_14_pct) else "—",
+                    delta=f"{vs_last_14_pct:+.0f}%" if pd.notna(vs_last_14_pct) else None,
+                    delta_color="inverse",
+                    help="Total forecasted cases over the next 14 days vs. total "
+                         "confirmed cases over the last 14 actual days.",
+                )
 
                 fc_table = pd.DataFrame({
                     "Date": [d.date() for d in blended["dates"]],
