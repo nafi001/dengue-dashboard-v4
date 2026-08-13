@@ -293,7 +293,6 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
 # --------------------------------------------------------------------------
 st.sidebar.title("🦟 Dengue Forecast")
 
-
 if not artifacts_available():
     st.sidebar.error("Model artifacts not found in `dashboard_artifacts/`.")
 else:
@@ -551,7 +550,7 @@ with tab_overview:
         latest_row_date = live_df.index.max().date()
         st.caption(f"Latest date in current dataset: **{latest_row_date}**")
 
-        if st.button("🔄 Regenerate forecast now", type="primary"):
+        if st.button("🔄 Generate forecast now", type="primary"):
             st.session_state["run_forecast"] = True
 
         if st.session_state.get("run_forecast"):
@@ -567,7 +566,11 @@ with tab_overview:
 
                 if blended.get("friday_adjusted"):
                     fri_list = ", ".join(d.strftime("%b %d") for d in blended["friday_adjusted"])
-                    
+                    st.info(
+                        f"ℹ️ Friday values ({fri_list}) are shown at half the model's raw "
+                        "prediction, correcting for known under/over-reporting of confirmed "
+                        "cases on Fridays in the source data."
+                    )
 
                 stale_dates = []
                 if blended["as_of_7"].date() < latest_row_date:
@@ -663,7 +666,7 @@ with tab_overview:
                     "text/csv",
                 )
         else:
-            st.info("Click **Regenerate forecast** to run the models on the current dataset.")
+            st.info("Click **Generate forecast** to run the models on the current dataset.")
 
     st.divider()
 
@@ -883,40 +886,33 @@ with tab_corr:
 with tab_reliability:
     st.subheader("Forecast reliability by step-ahead")
     st.caption(
-        "How accurate the model was on held-out test data at each individual "
-        "day of the forecast horizon (step 1 = tomorrow, step 7 = a week out, "
-        "etc.). Lower MAE/RMSE and higher R\u00b2 mean a more reliable step."
+        "How accurate the 14-day model was on held-out test data at each "
+        "individual day of the forecast horizon (step 1 = tomorrow, step 14 "
+        "= two weeks out). Lower MAE/RMSE and higher R\u00b2 mean a more "
+        "reliable step."
     )
 
-    metrics_by_h = {h: load_step_metrics(h) for h in HORIZONS}
-    available = {h: df for h, df in metrics_by_h.items() if df is not None}
+    reliability_horizon = 14
+    metrics_df = load_step_metrics(reliability_horizon)
 
-    if not available:
+    if metrics_df is None:
         st.info(
-            "No `step_metrics_h{H}.csv` files found in `dashboard_artifacts/`. "
-            "These are produced by the training script's per-step evaluation "
-            "loop \u2014 save one CSV per horizon with columns `step, mae, rmse, r2` "
-            "and this tab will pick them up automatically."
+            f"No `step_metrics_h{reliability_horizon}.csv` file found in "
+            "`dashboard_artifacts/`. This is produced by the training "
+            "script's per-step evaluation loop \u2014 save a CSV with columns "
+            "`step, mae, rmse, r2` and this tab will pick it up automatically."
         )
     else:
-        missing = [h for h in HORIZONS if h not in available]
-        if missing:
-            st.warning(f"Missing step metrics for horizon(s): {missing} "
-                      f"\u2014 showing what's available.")
-
-        colors = {7: "#4C9AFF", 14: "#E5484D", 28: "#F5A623"}
-
         metric_tabs = st.tabs(["MAE", "RMSE", "R\u00b2"])
         metric_specs = [("mae", "Mean Absolute Error (cases)"), ("rmse", "RMSE (cases)"), ("r2", "R\u00b2")]
 
         for mtab, (col, ylabel) in zip(metric_tabs, metric_specs):
             with mtab:
                 fig = go.Figure()
-                for h, df in available.items():
-                    fig.add_trace(go.Scatter(
-                        x=df["step"], y=df[col], mode="lines+markers",
-                        name=f"H={h}", line=dict(color=colors.get(h)),
-                    ))
+                fig.add_trace(go.Scatter(
+                    x=metrics_df["step"], y=metrics_df[col], mode="lines+markers",
+                    name=f"H={reliability_horizon}", line=dict(color="#E5484D"),
+                ))
                 if col == "r2":
                     fig.add_hline(y=0, line_color="gray", line_width=1, line_dash="dot")
                 fig.update_layout(
