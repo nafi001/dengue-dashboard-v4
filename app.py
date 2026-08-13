@@ -1,28 +1,3 @@
-"""
-Dengue Forecasting Dashboard — Continuous Forecasting (GA-SVR)
-================================================================
-Streamlit app for decision makers. Loads production models trained by
-train_ga_svr_dashboard.py, lets the user add daily data via input boxes
-(with a one-click historical-average autofill for weather), and
-regenerates the 7-day / 14-day forecast using the latest features.
-
-Directory layout expected (relative to this file):
-    app.py
-    features.py
-    dashboard_artifacts/
-        production_model_h7.pkl
-        production_model_h14.pkl
-        feature_columns_h7.json
-        feature_columns_h14.json
-        residual_std_h7.csv
-        residual_std_h14.csv
-        ga_best_params_h7.json
-        ga_best_params_h14.json
-        model_metadata.json
-    data/
-        current_data.csv      <- the "live" dataset the app reads/appends to
-"""
-
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -146,10 +121,6 @@ def append_new_row(df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
     row_df["date"] = pd.to_datetime(row_df["date"])
     row_df = row_df.set_index("date")
     row_df.columns = [c.strip().lower() for c in row_df.columns]
-
-    # Auto-derive any calendar columns the original CSV carried (year/month/day)
-    # so manually-added rows don't end up with blanks in columns the model
-    # doesn't use but that were present in the source data.
     for cal_col, val in [("year", new_date.year), ("month", new_date.month), ("day", new_date.day)]:
         if cal_col in df.columns:
             row_df[cal_col] = val
@@ -208,17 +179,6 @@ def generate_forecast(df_raw: pd.DataFrame, horizon: int, conf_z: float = CONF_Z
 
 
 def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKUP[DEFAULT_CONF_LEVEL]):
-    """
-    Produces one consistent 14-day forecast instead of two disagreeing ones.
-
-    Decision makers get confused when the 7-day model says day 3 is 560 but
-    the 14-day model says 682 for that same day — both are separately-trained
-    SVRs and will never agree exactly. Since the 7-day model is trained
-    specifically for near-term accuracy, we always use ITS predictions for
-    days 1-7, and only fall back to the 14-day model for days 8-14 (which
-    the 7-day model can't produce at all). The result is a single number
-    per date, everywhere.
-    """
     res7 = generate_forecast(df_raw, 7, conf_z=conf_z)
     res14 = generate_forecast(df_raw, 14, conf_z=conf_z) if 14 in HORIZONS else None
 
@@ -236,9 +196,6 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
         warnings.append(f"7-day model: missing {res7['missing_weather_cols'][:6]}")
 
     if res14 is not None:
-        # Append only steps 8-14 from the 14-day model — steps 1-7 are
-        # discarded even though the model produced them, specifically to
-        # avoid ever showing two different numbers for the same date.
         extra_dates = res14["dates"][7:]
         extra_pred = list(res14["pred"][7:])
         dates += extra_dates
@@ -262,12 +219,6 @@ def generate_blended_forecast(df_raw: pd.DataFrame, conf_z: float = CONF_Z_LOOKU
     pred_arr = np.array(pred, dtype=float)
     lower_arr = np.array(lower, dtype=float) if lower is not None else None
     upper_arr = np.array(upper, dtype=float) if upper is not None else None
-
-    # Known reporting artifact: confirmed-case counts are systematically
-    # under/over-reported on Fridays in the source data. Halve the forecast
-    # (and both interval bounds, so the band stays proportionally correct)
-    # for any date that falls on a Friday. This is a display-layer
-    # correction only — it never touches the trained model or its inputs.
     friday_mask = np.array([d.weekday() == 4 for d in dates])
     pred_arr[friday_mask] = pred_arr[friday_mask] / 2
     if lower_arr is not None:
@@ -307,8 +258,6 @@ st.sidebar.subheader("Add today's data")
 live_df = get_live_data()
 weather_cols_present_in_data = [c for c in WEATHER_COLS_CANDIDATES if live_df.empty or c in live_df.columns] \
     if not live_df.empty else WEATHER_COLS_CANDIDATES
-
-# Track autofilled values across the date-picker changing, via session_state
 if "autofill_values" not in st.session_state:
     st.session_state["autofill_values"] = {}
 
@@ -342,10 +291,6 @@ if autofill_clicked:
     else:
         vals = autofill_weather_for_date(live_df, entry_date, WEATHER_COLS_CANDIDATES)
         if vals:
-            # Write straight into each widget's own session_state key.
-            # Once a number_input has a `key`, Streamlit ignores value= on
-            # rerun and keeps whatever's already in session_state[key] — so
-            # value= alone can never update an already-rendered box.
             for k, v in vals.items():
                 st.session_state[f"input_{k}"] = round(float(v), 4)
             st.sidebar.success(
@@ -472,23 +417,16 @@ tab_overview, tab_corr, tab_reliability = st.tabs(
     ["📊 Overview & Forecast", "🔗 Weather correlation", "📈 Model reliability"]
 )
 
-# ---- OVERVIEW & FORECAST TAB ----------------------------------------------
 with tab_overview:
     latest_val = live_df[TARGET].iloc[-1]
     latest_date = live_df.index[-1]
-
-    # 7-day vs prior 7-day trend, as a percentage (more decision-legible than a raw delta)
     last_7 = live_df[TARGET].iloc[-7:].mean() if len(live_df) >= 7 else np.nan
     prev_7 = live_df[TARGET].iloc[-14:-7].mean() if len(live_df) >= 14 else np.nan
     if pd.notna(last_7) and pd.notna(prev_7) and prev_7 > 0:
         pct_change_7 = (last_7 - prev_7) / prev_7 * 100
     else:
         pct_change_7 = np.nan
-
-    # 14-day cumulative burden — smooths day-to-day noise, shows recent load
     cum_14 = live_df[TARGET].iloc[-14:].sum() if len(live_df) >= 14 else live_df[TARGET].sum()
-
-    # Same-month historical average — is this month running hot or normal for the season?
     current_month = latest_date.month
     hist_mask = (live_df.index.month == current_month) & (live_df.index.year < latest_date.year)
     hist_month_avg = live_df.loc[hist_mask, TARGET].mean() if hist_mask.any() else np.nan
@@ -549,10 +487,8 @@ with tab_overview:
 
         latest_row_date = live_df.index.max().date()
         st.caption(f"Latest date in current dataset: **{latest_row_date}**")
-
         if st.button("🔄 Generate forecast now", type="primary"):
             st.session_state["run_forecast"] = True
-
         if st.session_state.get("run_forecast"):
             try:
                 blended = generate_blended_forecast(live_df, conf_z=conf_z)
@@ -566,8 +502,7 @@ with tab_overview:
 
                 if blended.get("friday_adjusted"):
                     fri_list = ", ".join(d.strftime("%b %d") for d in blended["friday_adjusted"])
-                    
-
+            
                 stale_dates = []
                 if blended["as_of_7"].date() < latest_row_date:
                     stale_dates.append(f"7-day model (as of {blended['as_of_7'].date()})")
@@ -579,19 +514,15 @@ with tab_overview:
                         f"row ({latest_row_date}). This usually means a gap or missing field in a "
                         "recent entry — check the sidebar's data health check."
                     )
-
                 ffig = go.Figure()
                 hist_tail = live_df[TARGET].tail(30)
                 ffig.add_trace(go.Scatter(x=hist_tail.index, y=hist_tail.values, mode="lines", name="Recent actual"))
-
-                # split forecast trace by source so days 1-7 vs 8-14 are visually distinguishable
                 n7 = sum(1 for s in blended["source"] if s == "7-day model")
                 ffig.add_trace(go.Scatter(
                     x=blended["dates"][:n7], y=blended["pred"][:n7], mode="lines+markers",
                     name="Forecast (days 1\u20137)", line=dict(color="firebrick"),
                 ))
                 if len(blended["dates"]) > n7:
-                    # connect the two segments visually with an overlapping point
                     ffig.add_trace(go.Scatter(
                         x=blended["dates"][n7 - 1:], y=blended["pred"][n7 - 1:], mode="lines+markers",
                         name="Forecast (days 8\u201314)", line=dict(color="firebrick", dash="dot"),
@@ -665,8 +596,6 @@ with tab_overview:
             st.info("Click **Generate forecast** to run the models on the current dataset.")
 
     st.divider()
-
-    # ---------------- CASE TREND ----------------
     st.subheader("Case trend")
     window_options = sorted(set([30, 60, 90, 180, 365, len(live_df)]))
     window = st.select_slider("Show last N days", options=window_options, value=min(90, len(live_df)))
@@ -696,10 +625,6 @@ with tab_overview:
         yoy_years = st.multiselect("Years to compare", years_present, default=yoy_default)
         if yoy_years:
             yfig = go.Figure()
-            # Map every year onto a single common reference year (a leap year,
-            # so Feb 29 always has somewhere to go) so the x-axis shows real
-            # calendar dates ("Jan 15", "Feb 1"...) instead of raw day-of-year
-            # numbers, while still overlaying different years on one axis.
             REF_YEAR = 2020
             for yr in sorted(yoy_years):
                 yr_data = live_df[live_df.index.year == yr]
@@ -801,13 +726,11 @@ with tab_corr:
                 x=merged["weather"], y=merged["dengue"], mode="markers",
                 marker=dict(size=6, opacity=0.6), name="Days",
             ))
-            # simple linear trend line
             if merged["weather"].std() > 0:
                 coeffs = np.polyfit(merged["weather"], merged["dengue"], 1)
                 xs = np.linspace(merged["weather"].min(), merged["weather"].max(), 50)
                 ys = coeffs[0] * xs + coeffs[1]
                 scatter_fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Linear trend", line=dict(color="firebrick", dash="dash")))
-
             scatter_fig.update_layout(
                 height=420, margin=dict(t=30, b=20),
                 xaxis_title=f"{WEATHER_LABELS.get(corr_var, corr_var)} (lag {corr_lag}d)",
@@ -815,8 +738,6 @@ with tab_corr:
                 title=f"Pearson r = {r:.3f}  (n={len(merged)})",
             )
             st.plotly_chart(scatter_fig, use_container_width=True)
-
-            # correlation across a range of lags, for context
             with st.expander("See correlation across all lags 0–60 days"):
                 lag_range = range(0, 61)
                 rs = []
@@ -877,8 +798,6 @@ with tab_corr:
             )
             ts_fig.update_layout(height=520, margin=dict(t=40, b=20), hovermode="x unified", showlegend=False)
             st.plotly_chart(ts_fig, use_container_width=True)
-
-# ---- MODEL RELIABILITY TAB -----------------------------------------------
 with tab_reliability:
     st.subheader("Forecast reliability by step-ahead")
     st.caption(
