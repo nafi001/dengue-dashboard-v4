@@ -566,11 +566,7 @@ with tab_overview:
 
                 if blended.get("friday_adjusted"):
                     fri_list = ", ".join(d.strftime("%b %d") for d in blended["friday_adjusted"])
-                    st.info(
-                        f"ℹ️ Friday values ({fri_list}) are shown at half the model's raw "
-                        "prediction, correcting for known under/over-reporting of confirmed "
-                        "cases on Fridays in the source data."
-                    )
+                    
 
                 stale_dates = []
                 if blended["as_of_7"].date() < latest_row_date:
