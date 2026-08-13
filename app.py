@@ -407,7 +407,7 @@ if not live_df.empty:
 # MAIN — TABS
 # --------------------------------------------------------------------------
 st.title("Dengue Forecasting Dashboard")
-st.caption("Decision-support view — descriptive trends, current risk, and forward-looking forecasts.")
+#st.caption("Decision-support view — descriptive trends, current risk, and forward-looking forecasts.")
 
 if live_df.empty:
     st.info("👈 Add today's data or upload a CSV in the sidebar to get started.")
