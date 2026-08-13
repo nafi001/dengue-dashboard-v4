@@ -116,9 +116,11 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     the single latest row aligned to `feature_cols` (the exact column order
     the production model was trained on).
 
-    Returns (row_df, last_date, missing) — missing lists any requested
-    feature_cols not found (e.g. if a weather column is absent from the
-    current data / wasn't in this dataset when the model was trained).
+    Returns (row_df, last_date, missing, dropped_reason) where dropped_reason
+    is a dict {date: [offending columns]} for any of the most-recent rows
+    (up to 5) that got dropped for having NaN in a required feature — lets
+    the caller explain *why* the forecast is using an older date than the
+    dataset's actual latest row, instead of just noting that it is.
     """
     df_feat = add_features(df_raw, target=target)
 
@@ -129,6 +131,17 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
         c for c in feature_cols
         if c in df_feat.columns and c not in NON_PREDICTIVE_PASSTHROUGH_COLS
     ]
+
+    # Diagnose the tail BEFORE dropping, so we can report exactly which
+    # column(s) disqualified each of the most recent rows.
+    dropped_reason = {}
+    if cols_to_check:
+        tail_check = df_feat[cols_to_check].tail(5)
+        for dt, row_vals in tail_check.iterrows():
+            bad_cols = row_vals[row_vals.isna()].index.tolist()
+            if bad_cols:
+                dropped_reason[dt] = bad_cols
+
     df_feat_clean = df_feat.dropna(subset=cols_to_check) if cols_to_check else df_feat.dropna()
 
     if df_feat_clean.empty:
@@ -153,7 +166,7 @@ def build_latest_feature_row(df_raw: pd.DataFrame, feature_cols: list, target: s
     missing = [c for c in feature_cols if c not in last_row.columns]
     row = last_row.reindex(columns=feature_cols)  # missing -> NaN, order enforced
 
-    return row, last_date, missing
+    return row, last_date, missing, dropped_reason
 
 
 def daily_climatology(df_raw: pd.DataFrame, weather_cols: list) -> pd.DataFrame:
